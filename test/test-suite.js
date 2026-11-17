@@ -1443,6 +1443,7 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
         'a<noembed>&lt;p id=\'</noembed><img src="x">\'&gt;<p></p>',
         'a<noembed><p id="&lt;/noembed&gt;&lt;img src=x onerror=alert(1)&gt;"></p></noembed>',
         'a<noembed></noembed>',
+        'a<noembed><p></p></noembed>',
       ]);
     }
   );
@@ -2033,6 +2034,74 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
           'Payload: ' + payloads[i]
         );
       }
+    }
+  );
+  QUnit.test(
+    'Test against mXSS via raw-text closing tags inside attributes (CVE-2026-65914)',
+    function (assert) {
+      // Parse the sanitized markup again in an inert document, wrapped in
+      // the raw-text element the attribute value tries to close
+      var reparse = function (html) {
+        var doc = document.implementation.createHTMLDocument('');
+        doc.body.innerHTML = html;
+        return doc.body;
+      };
+
+      var tags = [
+        'script',
+        'xmp',
+        'textarea',
+        'noscript',
+        'iframe',
+        'noembed',
+        'noframes',
+        'style',
+        'title',
+      ];
+      for (var i = 0; i < tags.length; i++) {
+        var tag = tags[i];
+        var dirty = '<img alt="</' + tag + '><img src=x onerror=alert(1)>">';
+        var clean = DOMPurify.sanitize(dirty);
+        assert.equal(clean, '<img>', 'Payload: ' + dirty);
+
+        var body = reparse('<' + tag + '>' + clean + '</' + tag + '>');
+        assert.equal(
+          body.querySelectorAll('[onerror]').length,
+          0,
+          'Reparsed inside <' + tag + '>: ' + clean
+        );
+
+        // Closing tags are matched case-insensitively
+        dirty =
+          '<a title="</' +
+          tag.toUpperCase() +
+          '><img src=x onerror=alert(1)>">x</a>';
+        assert.equal(
+          DOMPurify.sanitize(dirty),
+          '<a>x</a>',
+          'Payload: ' + dirty
+        );
+      }
+
+      // DOMPurify parses <noscript> content as markup, while a browser with
+      // scripting enabled treats it as raw text once the output is rendered
+      dirty =
+        '<b><noscript><a alt="</noscript><img src=x onerror=alert(1)>"></noscript>';
+      assert.contains(
+        DOMPurify.sanitize(dirty),
+        ['<b><a></a></b>', '<b></b>', '<b><img src="x">"&gt;</b>'],
+        'Payload: ' + dirty
+      );
+
+      // Attribute values without raw-text closing tags are kept
+      assert.equal(
+        DOMPurify.sanitize('<img alt="script / xmp / textarea">'),
+        '<img alt="script / xmp / textarea">'
+      );
+      assert.contains(DOMPurify.sanitize('<img alt="</b>">'), [
+        '<img alt="</b>">',
+        '<img alt="&lt;/b&gt;">',
+      ]);
     }
   );
 };

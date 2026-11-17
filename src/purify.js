@@ -1012,6 +1012,17 @@ function createDOMPurify(window = getGlobal()) {
         continue;
       }
 
+      /* Work around mXSS with raw-text closing tags inside attributes */
+      if (
+        regExpTest(
+          /<\/(style|script|title|xmp|textarea|noscript|iframe|noembed|noframes)/i,
+          value
+        )
+      ) {
+        _removeAttribute(name, currentNode);
+        continue;
+      }
+
       /* Handle invalid data-* attribute set by try-catching it */
       try {
         if (namespaceURI) {
