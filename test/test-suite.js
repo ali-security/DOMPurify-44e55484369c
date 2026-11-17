@@ -1347,6 +1347,55 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       ]
     );
   });
+  QUnit.test(
+    'Config-Flag tests: USE_PROFILES ALLOWED_ATTR is prototype-free',
+    function (assert) {
+      // Inherited Array.prototype members must not count as allowed attributes
+      assert.equal(
+        DOMPurify.sanitize('<img fill="x" map="x" filter="x" src="x">', {
+          USE_PROFILES: {},
+          ADD_TAGS: ['img'],
+        }),
+        '<img>'
+      );
+      assert.equal(
+        DOMPurify.sanitize('<img fill="x" map="x" filter="x" src="x">', {
+          USE_PROFILES: { html: false },
+          ADD_TAGS: ['img'],
+        }),
+        '<img>'
+      );
+
+      // Persistent configuration and isValidAttribute() share the same set
+      try {
+        DOMPurify.setConfig({ USE_PROFILES: {}, ADD_TAGS: ['img'] });
+        assert.equal(DOMPurify.isValidAttribute('img', 'map', 'x'), false);
+        assert.equal(DOMPurify.sanitize('<img fill="x" src="x">'), '<img>');
+      } finally {
+        DOMPurify.clearConfig();
+      }
+
+      // Polluted Object.prototype must not allow event handlers
+      var clean;
+      try {
+        Object.defineProperty(Object.prototype, 'onerror', {
+          value: true,
+          writable: true,
+          configurable: true,
+        });
+        clean = DOMPurify.sanitize('<img src="x" onerror="alert(1)">', {
+          USE_PROFILES: {},
+          ADD_TAGS: ['img'],
+          FORBID_ATTR: ['style'],
+        });
+      } finally {
+        delete Object.prototype.onerror;
+        DOMPurify.clearConfig();
+      }
+
+      assert.equal(clean, '<img>');
+    }
+  );
   QUnit.test('Config-Flag tests: ALLOWED_URI_REGEXP', function (assert) {
     var tests = [
       {

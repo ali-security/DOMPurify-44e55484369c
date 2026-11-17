@@ -4,6 +4,7 @@ import * as EXPRESSIONS from './regexp';
 import {
   addToSet,
   clone,
+  create,
   freeze,
   objectKeys,
   arrayForEach,
@@ -407,7 +408,7 @@ function createDOMPurify(window = getGlobal()) {
     /* Parse profile info */
     if (USE_PROFILES) {
       ALLOWED_TAGS = addToSet({}, [...TAGS.text]);
-      ALLOWED_ATTR = [];
+      ALLOWED_ATTR = create(null);
       if (USE_PROFILES.html === true) {
         addToSet(ALLOWED_TAGS, TAGS.html);
         addToSet(ALLOWED_ATTR, ATTRS.html);
