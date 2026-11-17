@@ -1820,4 +1820,35 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       assert.equal(clean.indexOf('<img'), -1);
     }
   );
+  QUnit.test(
+    'Test against nesting-based mXSS via nested form and table elements',
+    function (assert) {
+      // Parse the sanitized markup again in an inert document, just like
+      // assigning it to innerHTML would, and look for elements that only
+      // show up after the namespace confusion of the round trip
+      var reparse = function (html) {
+        var doc = document.implementation.createHTMLDocument('');
+        doc.body.innerHTML = html;
+        return doc.body;
+      };
+
+      var payloads = [
+        '<form><math><mtext></form><form><mglyph><style></math><img src onerror=alert(1)>',
+        '<math><mtext><table><mglyph><style><img src=x onerror=alert(1)>',
+      ];
+      for (var i = 0; i < payloads.length; i++) {
+        var body = reparse(DOMPurify.sanitize(payloads[i]));
+        assert.equal(
+          body.querySelectorAll('img').length,
+          0,
+          'Payload: ' + payloads[i]
+        );
+        assert.equal(
+          body.querySelectorAll('[onerror]').length,
+          0,
+          'Payload: ' + payloads[i]
+        );
+      }
+    }
+  );
 };
