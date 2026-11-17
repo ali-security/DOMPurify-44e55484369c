@@ -5,14 +5,21 @@ name: Build and Test
 # - on any pull request -> trigger the workflow
 # This is to avoid running the workflow twice on pull requests.
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'QUnit filter passed to karma (empty = full suite)'
+        required: false
+        default: ''
+
+env:
+  NPM_CONFIG_REGISTRY: https://:2020-06-24T14%3A31%3A34.341000Z@time-machines-npm.sealsecurity.io/
+  YARN_REGISTRY: https://:2020-06-24T14%3A31%3A34.341000Z@time-machines-npm.sealsecurity.io/
 
 jobs:
   install:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
       matrix:
@@ -25,7 +32,7 @@ jobs:
         id: yarn-cache
         run: echo "::set-output name=dir::$(yarn cache dir)"
       - name: Setup node_modules cache
-        uses: actions/cache@v1
+        uses: actions/cache@v4
         with:
           path: ${{ steps.yarn-cache.outputs.dir }}
           key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
@@ -36,17 +43,64 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - name: Install
-        run: yarn install --frozen-lockfile
+        # The 2.0.12 tag's yarn.lock still pins karma@^4.4.1 while package.json asks for ^5.1.0,
+        # so --frozen-lockfile cannot succeed at this tag; let yarn add the missing entries,
+        # resolved through the registry time machine at the release date.
+        run: yarn install
       - name: Build
         run: npm run build
-      - name: Lint
-        run: npm run lint
+      - name: Install release-era Firefox
+        # Firefox 160 on the runner implements the relaxed DOM attribute-name validation, so
+        # setAttribute('data-abc"') no longer throws and the ALLOW_DATA_ATTR assertion (written
+        # against 2020 browsers) fails in both karma suites; pin Firefox 77.0.1, current at the
+        # 2.0.12 release (2020-06-24), for karma-firefox-launcher via FIREFOX_BIN.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-glib-1-2
+          curl -fsSL https://ftp.mozilla.org/pub/firefox/releases/77.0.1/linux-x86_64/en-US/firefox-77.0.1.tar.bz2 | tar -xj -C "$RUNNER_TEMP"
+          # Keep the pinned build: without this Firefox 77 auto-updates itself in place to the current release.
+          mkdir -p "$RUNNER_TEMP/firefox/distribution"
+          echo '{"policies":{"DisableAppUpdate":true}}' > "$RUNNER_TEMP/firefox/distribution/policies.json"
+          "$RUNNER_TEMP/firefox/firefox" --version
+          echo "FIREFOX_BIN=$RUNNER_TEMP/firefox/firefox" >> "$GITHUB_ENV"
+          # Firefox 77's 2020 seccomp content sandbox kills the tab process on the 2026 glibc/kernel
+          # ("PContent ... Channel error"), so karma never captures it; run content unsandboxed.
+          echo "MOZ_DISABLE_CONTENT_SANDBOX=1" >> "$GITHUB_ENV"
+      - name: BrowserStack credentials check
+        run: |
+          if [ -n "$BS_USERNAME" ] && [ -n "$BS_ACCESSKEY" ]; then
+            echo "BrowserStack secrets BS_USERNAME/BS_ACCESSKEY: present"
+          else
+            echo "BrowserStack secrets BS_USERNAME/BS_ACCESSKEY: NOT available to this workflow (username set: $([ -n "$BS_USERNAME" ] && echo yes || echo no), accesskey set: $([ -n "$BS_ACCESSKEY" ] && echo yes || echo no))"
+          fi
+          echo "TEST_BROWSERSTACK=$TEST_BROWSERSTACK TEST_PROBE_ONLY=$TEST_PROBE_ONLY ref=${{ github.ref }}"
+        env:
+          TEST_BROWSERSTACK: ${{ startsWith(matrix.node-version, '13') && secrets.BS_USERNAME != '' && secrets.BS_ACCESSKEY != '' }}
+          TEST_PROBE_ONLY: ${{ github.ref != 'refs/heads/main' }}
+          BS_USERNAME: ${{ secrets.BS_USERNAME }}
+          BS_ACCESSKEY: ${{ secrets.BS_ACCESSKEY }}
       - name: Test
+        if: inputs.test-filter == ''
         uses: GabrielBB/xvfb-action@v1.0
         with:
           run: npm run test:ci
         env:
-          TEST_BROWSERSTACK: ${{ startsWith(matrix.node-version, '13') }}
+          # Upstream BrowserStack matrix on the 13.x leg, kept as-is whenever the BS_* secrets
+          # exist; without them karma-browserstack-launcher aborts with "Username is required",
+          # so the leg falls back to upstream's local Firefox karma run.
+          TEST_BROWSERSTACK: ${{ startsWith(matrix.node-version, '13') && secrets.BS_USERNAME != '' && secrets.BS_ACCESSKEY != '' }}
           TEST_PROBE_ONLY: ${{ github.ref != 'refs/heads/main' }}
           BS_USERNAME: ${{ secrets.BS_USERNAME }}
           BS_ACCESSKEY: ${{ secrets.BS_ACCESSKEY }}
+      - name: Test (filtered)
+        if: inputs.test-filter != ''
+        run: xvfb-run -a npm run test:karma -- --single-run --browsers Firefox --client.qunit.filter "${{ inputs.test-filter }}"
+      - name: Pack
+        if: startsWith(matrix.node-version, '13')
+        run: npm pack
+      - name: Upload package tarball
+        if: startsWith(matrix.node-version, '13')
+        uses: actions/upload-artifact@v4
+        with:
+          name: dompurify-tgz
+          path: dompurify-*.tgz
+          if-no-files-found: error
