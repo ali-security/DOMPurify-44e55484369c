@@ -221,6 +221,15 @@ function createDOMPurify(window = getGlobal()) {
   /* Track whether config is already set on this instance of DOMPurify. */
   let SET_CONFIG = false;
 
+  /* Pristine allowlist bindings captured whenever the configuration is
+   * parsed (and therefore also at setConfig() time). Where sanitize() skips
+   * re-deriving the sets - the persistent setConfig() path, or a repeated
+   * call with the very same config object - they are restored from these,
+   * so a hook's in-call widening cannot carry across calls. Null until the
+   * config is parsed; reset by clearConfig(). */
+  let PRISTINE_ALLOWED_TAGS = null;
+  let PRISTINE_ALLOWED_ATTR = null;
+
   /* Decide if all elements (e.g. style, script) must be children of
    * document.body. By default, browsers might move them to document.head */
   let FORCE_BODY = false;
@@ -334,6 +343,13 @@ function createDOMPurify(window = getGlobal()) {
   // eslint-disable-next-line complexity
   const _parseConfig = function (cfg) {
     if (CONFIG && CONFIG === cfg) {
+      /* The sets are not re-derived on this path. CONFIG is handed to the
+       * hooks as their third argument, so a caller can pass it straight back
+       * in - restore the sets from the pristine bindings captured when this
+       * config was parsed, otherwise a previous call's hook clone (widened by
+       * a hook) would carry over. */
+      ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+      ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
       return;
     }
 
@@ -460,6 +476,12 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     CONFIG = cfg;
+
+    /* Capture the freshly derived allowlists. sanitize() restores the sets
+     * from these whenever it skips re-deriving them, keeping a hook's
+     * in-call widening scoped to the call it happened in. */
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   /**
@@ -623,6 +645,18 @@ function createDOMPurify(window = getGlobal()) {
           typeof object === 'object' &&
           typeof object.nodeType === 'number' &&
           typeof object.nodeName === 'string';
+  };
+
+  /**
+   * _hasHooks
+   * Check whether at least one hook is registered for an entry point.
+   * The `hooks` object is populated on demand, so the array may be absent.
+   *
+   * @param  {String} entryPoint  Name of the hook's entry point
+   * @return {Boolean} true if a hook is registered for the entry point
+   */
+  const _hasHooks = function (entryPoint) {
+    return Boolean(hooks[entryPoint] && hooks[entryPoint].length > 0);
   };
 
   /**
@@ -1110,7 +1144,28 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     /* Assign config vars */
-    if (!SET_CONFIG) {
+    if (SET_CONFIG) {
+      /* Persistent setConfig() path: _parseConfig is skipped, so the sets are
+       * not re-derived per call. Restore them from the pristine bindings
+       * captured at setConfig() time so a previous call's hook clone (mutated
+       * by a hook) does not carry over. */
+      ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+      ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
+
+      /* The uponSanitizeElement hook event exposes ALLOWED_TAGS (as
+       * allowedTags) and the uponSanitizeAttribute hook event exposes
+       * ALLOWED_ATTR (as allowedAttributes) by reference. Clone them before
+       * the walk whenever such a hook is registered, so a hook that widens
+       * them - documented in-call widening - only mutates this call's copy
+       * and never the persistent configuration. */
+      if (_hasHooks('uponSanitizeElement')) {
+        ALLOWED_TAGS = clone(ALLOWED_TAGS);
+      }
+
+      if (_hasHooks('uponSanitizeAttribute')) {
+        ALLOWED_ATTR = clone(ALLOWED_ATTR);
+      }
+    } else {
       _parseConfig(cfg);
     }
 
@@ -1277,6 +1332,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.setConfig = function (cfg) {
     _parseConfig(cfg);
     SET_CONFIG = true;
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   /**
@@ -1287,6 +1344,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.clearConfig = function () {
     CONFIG = null;
     SET_CONFIG = false;
+    PRISTINE_ALLOWED_TAGS = null;
+    PRISTINE_ALLOWED_ATTR = null;
   };
 
   /**
