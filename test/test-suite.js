@@ -1626,4 +1626,48 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       }
     }
   );
+  QUnit.test(
+    'Test protection from prototype pollution attacks 1/2',
+    function (assert) {
+      var obj = JSON.parse(
+        '{"ALLOWED_ATTR":["onerror","src"], "documentMode":9}'
+      );
+      var keys = Object.keys(obj);
+      var i;
+      var clean;
+      try {
+        for (i = 0; i < keys.length; i++) {
+          Object.prototype[keys[i]] = obj[keys[i]];
+        }
+        clean = DOMPurify.sanitize('<img src=x onerror=alert(1)>');
+      } finally {
+        for (i = 0; i < keys.length; i++) {
+          delete Object.prototype[keys[i]];
+        }
+      }
+      assert.equal(clean, '<img src="x">');
+    }
+  );
+  QUnit.test(
+    'Test protection from prototype pollution attacks 2/2',
+    function (assert) {
+      var obj = {};
+      /* Ignore IE10 issue */
+      if (obj.__proto__ === undefined) {
+        assert.equal(1, 1);
+        return true;
+      }
+      var originalHasOwnProperty = obj.__proto__.hasOwnProperty;
+      var clean;
+      try {
+        obj.__proto__.hasOwnProperty = Object;
+        obj.constructor.prototype.ALLOWED_ATTR = ['src', 'onerror'];
+        clean = DOMPurify.sanitize('<img src=x onerror=alert(1)>');
+      } finally {
+        obj.__proto__.hasOwnProperty = originalHasOwnProperty;
+        delete obj.constructor.prototype.ALLOWED_ATTR;
+      }
+      assert.equal(clean, '<img src="x">');
+    }
+  );
 };
