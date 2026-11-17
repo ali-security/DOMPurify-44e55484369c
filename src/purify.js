@@ -21,6 +21,9 @@ import {
   numberIsNaN,
   regExpTest,
   regExpCreate,
+  setAdd,
+  setCreate,
+  setHas,
   typeErrorCreate,
   lookupGetter,
 } from './utils';
@@ -936,7 +939,10 @@ function createDOMPurify(window = getGlobal()) {
    * though the handler never reached the returned tree. So on the IN_PLACE
    * path the detached subtree is neutralized inline and the node is treated
    * as removed. The walk root is exempt: a detached IN_PLACE root is
-   * legitimate input and must still be fully sanitized.
+   * legitimate input and must still be fully sanitized. This only sees the
+   * node the hook was called for; a hook that detaches some OTHER node (an
+   * ancestor, a later sibling) is caught by _neutralizeEscapedElements at
+   * the end of the call.
    *
    * @param  {Node} node the node a hook has just been executed for
    * @param  {Node} root the root node of the current walk
@@ -949,6 +955,98 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     return false;
+  };
+
+  /**
+   * _collectLiveNodes
+   *
+   * Every node reachable from `root`, in document order: its light-DOM
+   * subtree plus the subtrees of open attached shadow roots, recursively
+   * (each shadow root is listed right after its host, then its content).
+   * <template>.content is not entered - its nodes live in an inert document
+   * and neither fetch resources nor run handlers. Closed shadow roots are not
+   * reachable from script at all. Iterative and clobber-safe (cached
+   * getters), like _neutralizeSubtree, so a deep or clobbering tree can
+   * neither overflow the call stack nor hide a subtree.
+   *
+   * @param  {Node} root the in-place root
+   * @return {Array} the nodes, root first
+   */
+  const _collectLiveNodes = function (root) {
+    const nodes = [];
+    const stack = [root];
+
+    while (stack.length > 0) {
+      const node = arrayPop(stack);
+      arrayPush(nodes, node);
+
+      /* Pushed first, so processed after the host's light children. */
+      if (getShadowRoot && _getNodeType(node) === 1) {
+        let shadowRoot = null;
+        try {
+          shadowRoot = getShadowRoot(node);
+        } catch (_) {}
+
+        if (_isDocumentFragment(shadowRoot)) {
+          arrayPush(stack, shadowRoot);
+        }
+      }
+
+      let childNodes = null;
+      try {
+        childNodes = getChildNodes(node);
+      } catch (_) {}
+
+      if (childNodes) {
+        for (let i = childNodes.length - 1; i >= 0; --i) {
+          arrayPush(stack, childNodes[i]);
+        }
+      }
+    }
+
+    return nodes;
+  };
+
+  /**
+   * _neutralizeEscapedElements
+   *
+   * IN_PLACE completion of the hook-detach neutralization, keyed on the tree
+   * rather than on the node a hook was called for: every element that was
+   * under the root when sanitize() started, and is no longer under it now,
+   * has its non-allow-listed attributes stripped before sanitize() returns
+   * or rethrows.
+   *
+   * The inline neutralize in _sanitizeElements only notices a hook detaching
+   * the node it was called for. Anything else that leaves the tree mid-walk -
+   * a hook removing the current node's parent/ancestor or a not-yet-visited
+   * sibling, a hook moving a subtree out of the root, or a page custom
+   * element's attributeChangedCallback reacting to one of our own
+   * removeAttribute calls - takes its subtree out of the walker's reach
+   * unsanitized, and a handler there (an <img onerror> that started loading
+   * when the caller built the live tree) fires in page scope after we
+   * return. Comparing a snapshot taken before any hook or reaction could run
+   * against what is still reachable covers every such route at once.
+   * GHSA-mrv2-3pqr-j5jr.
+   *
+   * Strips per element rather than per detached subtree: each descendant of
+   * an escaped subtree is itself in the snapshot, so this stays linear in
+   * tree size. Elements DOMPurify removed itself are stripped as well, which
+   * is harmless for nodes that leave the output anyway.
+   *
+   * @param  {Node} root the in-place root
+   * @param  {Array} before the root's nodes, collected before the walk
+   */
+  const _neutralizeEscapedElements = function (root, before) {
+    const reachable = setCreate();
+    arrayForEach(_collectLiveNodes(root), (node) => {
+      setAdd(reachable, node);
+    });
+    arrayForEach(before, (node) => {
+      const nodeType = getNodeType ? _getNodeType(node) : node.nodeType;
+      if (nodeType === 1 && !setHas(reachable, node)) {
+        _stripDisallowedAttributes(node);
+      }
+    });
   };
 
   /**
@@ -1247,6 +1345,13 @@ function createDOMPurify(window = getGlobal()) {
       hookEvent.forceKeepAttr = undefined; // Allows developers to see this is a property they can set
       _executeHook('uponSanitizeAttribute', currentNode, hookEvent);
       value = hookEvent.attrValue;
+
+      /* Make sure we cannot easily use animated hrefs, even if animations are allowed */
+      if (lcName === 'attributename' && stringMatch(value, 'href')) {
+        _removeAttribute(name, currentNode);
+        continue;
+      }
+
       /* Did the hooks approve of the attribute? */
       if (hookEvent.forceKeepAttr) {
         continue;
@@ -1457,6 +1562,9 @@ function createDOMPurify(window = getGlobal()) {
     let currentNode;
     let oldNode;
     let returnNode;
+    /* IN_PLACE only: the root's nodes before any hook or custom-element
+       reaction can run, for _neutralizeEscapedElements */
+    let inPlaceNodes = [];
     /* Make sure we have a string to sanitize.
       DO NOT return early, as this will return the wrong type if
       the user has requested a DOM object rather than a string */
@@ -1552,6 +1660,11 @@ function createDOMPurify(window = getGlobal()) {
           'root node is clobbered and cannot be sanitized in-place'
         );
       }
+
+      /* Snapshot the root's nodes now: the root pre-flight above runs no
+         hooks, and everything from the walk on can detach or move nodes
+         (hooks, custom-element reactions). See _neutralizeEscapedElements. */
+      inPlaceNodes = _collectLiveNodes(dirty);
     } else if (dirty instanceof Node) {
       /* If dirty is a DOM element, append to an empty document to avoid
          elements being stripped by the parser */
@@ -1599,57 +1712,71 @@ function createDOMPurify(window = getGlobal()) {
     const nodeIterator = _createIterator(walkRoot);
 
     /* Now start iterating over the created document */
-    while ((currentNode = nodeIterator.nextNode())) {
-      /* Fix IE's strange behavior with manipulated textNodes #89 */
-      if (currentNode.nodeType === 3 && currentNode === oldNode) {
-        continue;
-      }
-
-      /* Sanitize tags and elements */
-      if (_sanitizeElements(currentNode, walkRoot)) {
-        continue;
-      }
-
-      const parentNode = getParentNode(currentNode);
-
-      /* Set the nesting depth of an element */
-      if (currentNode.nodeType === 1) {
-        if (parentNode && parentNode.__depth) {
-          /*
-            We want the depth of the node in the original tree, which can
-            change when it's removed from its parent.
-          */
-          currentNode.__depth =
-            (currentNode.__removalCount || 0) + parentNode.__depth + 1;
-        } else {
-          currentNode.__depth = 1;
+    try {
+      while ((currentNode = nodeIterator.nextNode())) {
+        /* Fix IE's strange behavior with manipulated textNodes #89 */
+        if (currentNode.nodeType === 3 && currentNode === oldNode) {
+          continue;
         }
+
+        /* Sanitize tags and elements */
+        if (_sanitizeElements(currentNode, walkRoot)) {
+          continue;
+        }
+
+        const parentNode = getParentNode(currentNode);
+
+        /* Set the nesting depth of an element */
+        if (currentNode.nodeType === 1) {
+          if (parentNode && parentNode.__depth) {
+            /*
+              We want the depth of the node in the original tree, which can
+              change when it's removed from its parent.
+            */
+            currentNode.__depth =
+              (currentNode.__removalCount || 0) + parentNode.__depth + 1;
+          } else {
+            currentNode.__depth = 1;
+          }
+        }
+
+        /*
+         * Remove an element if nested too deeply to avoid mXSS
+         * or if the __depth might have been tampered with
+         */
+        if (
+          currentNode.__depth >= MAX_NESTING_DEPTH ||
+          currentNode.__depth < 0 ||
+          numberIsNaN(currentNode.__depth)
+        ) {
+          _forceRemove(currentNode);
+        }
+
+        /* Shadow DOM detected, sanitize it. Realm-safe check
+           (GHSA-hpcv-96wg-7vj8): nodeType-based detection instead of
+           instanceof, so <template>.content of a foreign realm is walked. */
+        if (_isDocumentFragment(currentNode.content)) {
+          currentNode.content.__depth = currentNode.__depth;
+          _sanitizeShadowDOM(currentNode.content);
+        }
+
+        /* Check attributes, sanitize if necessary */
+        _sanitizeAttributes(currentNode, walkRoot);
+
+        oldNode = currentNode;
+      }
+    } catch (error) {
+      /* A hook (or a custom-element reaction) threw mid-walk. On the
+         IN_PLACE path, anything that already left the root by then (a
+         subtree a hook detached or moved out, or one DOMPurify removed)
+         is never handed back but may still carry a queued resource
+         handler: defuse it before the error propagates.
+         GHSA-mrv2-3pqr-j5jr */
+      if (IN_PLACE) {
+        _neutralizeEscapedElements(dirty, inPlaceNodes);
       }
 
-      /*
-       * Remove an element if nested too deeply to avoid mXSS
-       * or if the __depth might have been tampered with
-       */
-      if (
-        currentNode.__depth >= MAX_NESTING_DEPTH ||
-        currentNode.__depth < 0 ||
-        numberIsNaN(currentNode.__depth)
-      ) {
-        _forceRemove(currentNode);
-      }
-
-      /* Shadow DOM detected, sanitize it. Realm-safe check
-         (GHSA-hpcv-96wg-7vj8): nodeType-based detection instead of
-         instanceof, so <template>.content of a foreign realm is walked. */
-      if (_isDocumentFragment(currentNode.content)) {
-        currentNode.content.__depth = currentNode.__depth;
-        _sanitizeShadowDOM(currentNode.content);
-      }
-
-      /* Check attributes, sanitize if necessary */
-      _sanitizeAttributes(currentNode, walkRoot);
-
-      oldNode = currentNode;
+      throw error;
     }
 
     oldNode = null;
@@ -1674,6 +1801,15 @@ function createDOMPurify(window = getGlobal()) {
           rootWasRemoved = true;
         }
       });
+
+      /* The inline neutralize in _sanitizeElements only covers a hook
+         detaching the node it was called for. Also defuse every element
+         that left the root by any other route during the call - a hook
+         removing an ancestor or a not-yet-visited sibling, a hook moving a
+         subtree out, a page custom element's reaction - which the walk
+         could no longer reach. Before the root-removed throw, so that exit
+         is covered too. GHSA-mrv2-3pqr-j5jr */
+      _neutralizeEscapedElements(dirty, inPlaceNodes);
 
       if (rootWasRemoved) {
         _neutralizeSubtree(dirty);

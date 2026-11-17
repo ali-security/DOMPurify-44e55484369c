@@ -4120,4 +4120,465 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
     );
   });
 
+  /* GHSA-c6gr-qvv4-5v3f: an SVG animation element (<animate>, <set>, ...)
+     targeting href lets an allowed <a> get a javascript: link after
+     sanitization (attributeName="href" values="x;javascript:..." passes the
+     URI check on values). An attributeName attribute whose value names href
+     is now always removed, even when animations are allowed and even when a
+     hook asks to keep it.
+     The serialized output is compared lowercased, as browsers and jsdom do
+     not agree on the case of the SVG attribute name. */
+  var hasAnimatedHref = function (clean) {
+    return /attributename/.test(clean.toLowerCase());
+  };
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: attributeName="href" is removed from allowed animations',
+    function (assert) {
+      var payloads = [
+        {
+          dirty:
+            '<svg><a id="q"><animate attributeName="href" ' +
+            'values="x;javascript:alert(1)" dur="0.01s" fill="freeze"/>' +
+            '<text x="10" y="40">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="href" dur="1s" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'], ADD_ATTR: ['attributeName'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><set attributeName="href" to="javascript:alert(1)">' +
+            '</set><text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['set'], ADD_ATTR: ['to'] },
+          tag: '<set',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="xlink:href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate ATTRIBUTENAME="href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="  href  " ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          // animateTransform is allowed by the default configuration
+          dirty:
+            '<svg><a><animateTransform attributeName="href" ' +
+            'values="x;javascript:alert(1)"></animateTransform>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: {},
+          tag: '<animatetransform',
+        },
+      ];
+
+      payloads.forEach(function (payload) {
+        withFreshPurify(function (purify) {
+          var clean = purify.sanitize(payload.dirty, payload.config);
+          assert.ok(
+            clean.toLowerCase().indexOf(payload.tag) !== -1,
+            payload.dirty + ': animation element kept (' + clean + ')'
+          );
+          assert.notOk(
+            hasAnimatedHref(clean),
+            payload.dirty + ': attributeName removed (' + clean + ')'
+          );
+        });
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: attributeName="href" is removed even when a hook forces it to be kept',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeAttribute', function (node, data) {
+          if (data.attrName === 'attributename') {
+            data.forceKeepAttr = true;
+          }
+        });
+
+        var clean = purify.sanitize(
+          '<svg><a><animate attributeName="href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.notOk(
+          hasAnimatedHref(clean),
+          'attributeName removed despite forceKeepAttr (' + clean + ')'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: a hook rewriting attributeName to href does not keep it',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeAttribute', function (node, data) {
+          if (data.attrName === 'attributename') {
+            data.attrValue = 'href';
+          }
+        });
+
+        var clean = purify.sanitize(
+          '<svg><a><animate attributeName="fill" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.notOk(
+          hasAnimatedHref(clean),
+          'rewritten attributeName removed (' + clean + ')'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: attributeName targeting other attributes is kept',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        var clean = purify.sanitize(
+          '<svg><rect width="10" height="10">' +
+            '<animate attributeName="fill" values="red;blue" dur="1s">' +
+            '</animate></rect></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.ok(
+          clean.toLowerCase().indexOf('attributename="fill"') !== -1,
+          'attributeName="fill" kept (' + clean + ')'
+        );
+
+        clean = purify.sanitize(
+          '<svg><rect width="10" height="10">' +
+            '<animateTransform attributeName="transform" type="rotate" ' +
+            'from="0" to="90" dur="1s"></animateTransform></rect></svg>'
+        );
+        assert.ok(
+          clean.toLowerCase().indexOf('attributename="transform"') !== -1,
+          'attributeName="transform" kept (' + clean + ')'
+        );
+      });
+    }
+  );
+
+  /* GHSA-mrv2-3pqr-j5jr: the CVE-2026-75838 inline neutralize only notices a
+     hook detaching the node it was called for. A hook that detaches some
+     OTHER node - the current node's parent or a further ancestor, a sibling
+     the walk has not reached yet, an unrelated not-yet-visited subtree, or a
+     subtree it moves out of the root - takes that subtree out of the
+     walker's reach unsanitized, and it is not in DOMPurify.removed either
+     (incomplete fix for GHSA-p98j-92pf-mc4p). The IN_PLACE exit now
+     neutralizes every element that was under the root when sanitize()
+     started and is no longer under it, whatever detached it. Same shape as
+     the CVE-2026-75838 tests: onerror without src, assert the attribute is
+     gone. */
+  detachingHooks.forEach(function (hook) {
+    QUnit.test(
+      'GHSA-mrv2-3pqr-j5jr: IN_PLACE: ' +
+        hook +
+        ' detaching a node other than its own neutralizes it',
+      function (assert) {
+        var elsewhere = document.createElement('div');
+        // Element references are captured up front rather than read via
+        // nextElementSibling, which not every DOM implementation provides.
+        var shapes = {
+          parent: function (refs) {
+            detachNode(refs.figure);
+          },
+          ancestor: function (refs) {
+            detachNode(refs.section);
+          },
+          'later sibling': function (refs) {
+            detachNode(refs.tail);
+          },
+          'unvisited subtree': function (refs) {
+            detachNode(refs.far);
+          },
+          'moved out of root': function (refs) {
+            elsewhere.appendChild(refs.figure);
+          },
+        };
+
+        Object.keys(shapes).forEach(function (shape) {
+          withFreshPurify(function (purify) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<section><figure><i></i>' +
+              '<img id="tail" onerror="alert(1)"></figure></section>' +
+              '<p>ok</p>' +
+              '<aside id="far"><img id="far-tail" onerror="alert(2)"></aside>';
+            var refs = {
+              section: root.querySelector('section'),
+              figure: root.querySelector('figure'),
+              tail: root.querySelector('#tail'),
+              far: root.querySelector('#far'),
+            };
+            var farTail = root.querySelector('#far-tail');
+            var fired = false;
+
+            purify.addHook(hook, function (node) {
+              if (!fired && node.nodeName === 'I') {
+                fired = true;
+                shapes[shape](refs);
+              }
+            });
+
+            var ret = purify.sanitize(root, { IN_PLACE: true });
+
+            assert.strictEqual(ret, root, shape + ': returns the root');
+            assert.ok(fired, shape + ': hook ran');
+            assert.strictEqual(
+              refs.tail.getAttribute('onerror'),
+              null,
+              shape + ': handler stripped from #tail'
+            );
+            assert.strictEqual(
+              farTail.getAttribute('onerror'),
+              null,
+              shape + ': handler stripped from #far-tail'
+            );
+          });
+        });
+      }
+    );
+  });
+
+  QUnit.test(
+    'GHSA-mrv2-3pqr-j5jr: IN_PLACE: uponSanitizeShadowNode detaching a not-yet-visited sibling neutralizes it',
+    function (assert) {
+      // This version walks <template>.content (not the attached shadow roots
+      // of the in-place tree) through _sanitizeShadowDOM, so the shadow node
+      // hook fires for template content. It detaches a light-DOM sibling
+      // the main walk has not reached yet.
+      var probe = document.createElement('div');
+      probe.innerHTML = '<template><i></i></template>';
+      var probeTemplate = probe.firstChild;
+      if (!probeTemplate.content || !probeTemplate.content.firstChild) {
+        assert.ok(true, 'SKIP: <template> content not supported');
+        return;
+      }
+
+      withFreshPurify(function (purify) {
+        var root = document.createElement('div');
+        root.innerHTML =
+          '<template><i></i></template>' +
+          '<b><img id="tail" onerror="alert(1)"></b><p>ok</p>';
+        var tail = root.querySelector('#tail');
+        var sibling = root.querySelector('b');
+        var fired = false;
+
+        purify.addHook('uponSanitizeShadowNode', function (node) {
+          if (node.nodeName === 'I' && sibling.parentNode) {
+            fired = true;
+            detachNode(sibling);
+          }
+        });
+
+        purify.sanitize(root, { IN_PLACE: true });
+
+        assert.ok(fired, 'hook ran');
+        assert.strictEqual(
+          tail.getAttribute('onerror'),
+          null,
+          'handler stripped from the sibling the shadow node hook detached'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-mrv2-3pqr-j5jr: IN_PLACE: a hook detaching a shadow host neutralizes its open shadow root',
+    function (assert) {
+      if (!supportsShadowRoots()) {
+        assert.ok(true, 'SKIP: attachShadow not supported');
+        return;
+      }
+
+      withFreshPurify(function (purify) {
+        var root = document.createElement('div');
+        root.innerHTML = '<i></i><section></section><p>ok</p>';
+        var host = root.querySelector('section');
+        host.attachShadow({ mode: 'open' }).innerHTML =
+          '<img id="tail" onerror="alert(1)">';
+        var tail = host.shadowRoot.querySelector('#tail');
+
+        purify.addHook('afterSanitizeAttributes', function (node) {
+          if (node.nodeName === 'I' && host.parentNode) {
+            detachNode(host);
+          }
+        });
+
+        purify.sanitize(root, { IN_PLACE: true });
+
+        assert.notOk(host.parentNode, 'the hook detached the host');
+        assert.strictEqual(
+          tail.getAttribute('onerror'),
+          null,
+          'handler stripped inside the detached host shadow root'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-mrv2-3pqr-j5jr: IN_PLACE: a custom element reaction detaching a sibling neutralizes it, no hook involved',
+    function (assert) {
+      // DOMPurify's own removeAttribute('onclick') on an allowed custom
+      // element runs the page's attributeChangedCallback synchronously,
+      // which detaches the next sibling before the walk reaches it.
+      if (
+        typeof window.customElements === 'undefined' ||
+        typeof window.Reflect === 'undefined'
+      ) {
+        assert.ok(true, 'SKIP: custom elements not supported');
+        return;
+      }
+
+      if (!window.customElements.get('inplace-sibling-surgeon')) {
+        // An ES5 constructor rather than a class: the browser run transpiles
+        // this suite to ES5, and a transpiled class can not construct an
+        // HTMLElement.
+        var Surgeon = function () {
+          return window.Reflect.construct(window.HTMLElement, [], Surgeon);
+        };
+        Surgeon.prototype = Object.create(window.HTMLElement.prototype);
+        Surgeon.prototype.constructor = Surgeon;
+        Surgeon.observedAttributes = ['onclick'];
+        Surgeon.prototype.attributeChangedCallback = function (
+          name,
+          oldValue,
+          newValue
+        ) {
+          var next = this.nextElementSibling;
+          if (newValue === null && next) {
+            next.parentNode.removeChild(next);
+          }
+        };
+        window.customElements.define('inplace-sibling-surgeon', Surgeon);
+      }
+
+      withFreshPurify(function (purify) {
+        var root = document.createElement('div');
+        // Connected, so the element is upgraded and its reactions run.
+        document.body.appendChild(root);
+        try {
+          root.innerHTML =
+            '<inplace-sibling-surgeon onclick="x"></inplace-sibling-surgeon>' +
+            '<b><img id="tail" onerror="alert(1)"></b>';
+          var tail = root.querySelector('#tail');
+
+          purify.sanitize(root, {
+            IN_PLACE: true,
+            ADD_TAGS: ['inplace-sibling-surgeon'],
+          });
+
+          assert.notOk(root.querySelector('b'), 'the reaction detached <b>');
+          assert.strictEqual(
+            tail.getAttribute('onerror'),
+            null,
+            'handler stripped from the sibling a reaction detached'
+          );
+        } finally {
+          detachNode(root);
+          window.xssed = false;
+        }
+      });
+    }
+  );
+
+  QUnit.test(
+    "GHSA-mrv2-3pqr-j5jr: IN_PLACE: a node another node's hook detached is neutralized on the abort path too",
+    function (assert) {
+      withFreshPurify(function (purify) {
+        var root = document.createElement('div');
+        root.innerHTML =
+          '<figure><i></i><img id="tail" onerror="alert(1)"></figure><p>ok</p>';
+        var tail = root.querySelector('#tail');
+
+        purify.addHook('afterSanitizeAttributes', function (node) {
+          if (node.nodeName === 'I') {
+            detachNode(node.parentNode);
+            throw new Error('hook failure after detaching');
+          }
+        });
+
+        assert.throws(
+          function () {
+            purify.sanitize(root, { IN_PLACE: true });
+          },
+          /hook failure after detaching/,
+          'the hook error propagates'
+        );
+        assert.strictEqual(
+          tail.getAttribute('onerror'),
+          null,
+          'handler stripped before the rethrow'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-mrv2-3pqr-j5jr: IN_PLACE: nodes a hook creates are left alone by the escaped-node pass',
+    function (assert) {
+      // Only the caller's original nodes are neutralized; content a hook
+      // inserts itself stays the hook's responsibility, as before.
+      withFreshPurify(function (purify) {
+        var root = document.createElement('div');
+        root.innerHTML = '<p>a</p><i></i>';
+
+        purify.addHook('afterSanitizeAttributes', function (node) {
+          if (node.nodeName === 'I') {
+            var mark = document.createElement('mark');
+            mark.setAttribute('data-from-hook', '1');
+            mark.setAttribute('onclick', 'trusted()');
+            root.insertBefore(mark, root.firstChild);
+          }
+        });
+
+        purify.sanitize(root, { IN_PLACE: true });
+
+        var mark = root.querySelector('mark');
+        assert.ok(mark, 'hook-created node kept');
+        assert.equal(
+          mark.getAttribute('onclick'),
+          'trusted()',
+          'hook-created node not re-sanitized'
+        );
+      });
+    }
+  );
+
 };
