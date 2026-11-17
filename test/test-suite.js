@@ -3901,4 +3901,223 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       });
     }
   );
+
+  /* GHSA-6688-9rhm-gjv2: an IN_PLACE root that the walk itself force-removes
+     (e.g. an <xmp> root, which is not on the default allow-list) used to be
+     handed back to the caller. Its attributes were never inspected because
+     the walk skips _sanitizeAttributes for removed nodes, and for a rawtext
+     root whose text already carries its own end tag the literal
+     serialization ("<xmp></xmp><img ...></xmp>") re-opens markup on a plain
+     HTML reparse. sanitize() must refuse such a root instead of returning
+     it. */
+  QUnit.test(
+    'throws instead of returning a force-removed rawtext root (mXSS reparse)',
+    function (assert) {
+      // An <xmp> passed as the IN_PLACE root is force-removed as a disallowed
+      // element, and its text content already carries its own end tag: its
+      // literal serialization ("</xmp><img ...>") re-opens markup on an HTML
+      // reparse, and the onclick below was never inspected. The detached root
+      // must not be handed back to the caller. Fail closed - assert the
+      // return contract, not merely a scrubbed textContent, so a future
+      // refactor cannot pass by defanging text while still returning.
+      var dirty = document.createElement('xmp');
+      dirty.setAttribute('onclick', 'alert(1)');
+      dirty.textContent = '</xmp><img src=x onerror=alert(1)>';
+      document.body.appendChild(dirty);
+
+      assert.throws(
+        function () {
+          DOMPurify.sanitize(dirty, { IN_PLACE: true });
+        },
+        /refusing to sanitize in place/,
+        'force-removed rawtext root is not returned'
+      );
+      assert.ok(
+        DOMPurify.removed.some(function (entry) {
+          return entry.element === dirty;
+        }),
+        'root was recorded as removed during the aborted call'
+      );
+      assert.equal(
+        dirty.getAttribute('onclick'),
+        null,
+        'the on* handler on the refused root is cancelled'
+      );
+
+      if (dirty.parentNode) {
+        dirty.parentNode.removeChild(dirty);
+      }
+
+      window.xssed = false;
+    }
+  );
+
+  QUnit.test(
+    'still returns the root when a rawtext CHILD (not the root) is removed',
+    function (assert) {
+      // The fail-closed guard must fire ONLY when the ROOT itself is
+      // force-removed. A dangerous rawtext child (a disallowed <xmp>) is
+      // detached from the returned root as usual; the root remains safe to
+      // return, so the guard must not over-trigger on ordinary child
+      // removals.
+      var dirty = document.createElement('div');
+      dirty.innerHTML = '<span>ok</span>';
+      var xmp = document.createElement('xmp');
+      xmp.textContent = '</xmp><img src=x onerror=alert(1)>';
+      dirty.appendChild(xmp);
+      document.body.appendChild(dirty);
+
+      var clean = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+      assert.equal(clean, dirty, 'returns the input root');
+      assert.equal(
+        dirty.querySelector('xmp'),
+        null,
+        'dangerous rawtext child removed from the returned root'
+      );
+      assert.equal(
+        dirty.querySelector('span').textContent,
+        'ok',
+        'safe sibling content preserved'
+      );
+
+      if (dirty.parentNode) {
+        dirty.parentNode.removeChild(dirty);
+      }
+
+      window.xssed = false;
+    }
+  );
+
+  /* GHSA-6688-9rhm-gjv2 exploit variants: every root-kill reason this
+     version has (disallowed tag, FORBID_TAGS, the noembed end-tag check, the
+     svg/math mXSS check), attached and parent-less roots. Without the fix
+     each root is handed back with its attributes uninspected. Each case
+     either refuses the root, or whatever is
+     handed back must not re-open markup when the app stores and re-renders
+     it (serialize + plain HTML reparse). The reparse probe builds an <img>
+     without src, so nothing can load or fire in the live document. */
+  var GHSA6688_SINK = '<img onerror="window.__ghsa6688 = 1">';
+  var ghsa6688ReparseSinks = function (node) {
+    var probe = document.createElement('div');
+    probe.innerHTML = node.outerHTML;
+    var sinks = probe.querySelectorAll('img, script, [onerror], [onclick]');
+    return sinks.length;
+  };
+  [
+    {
+      label: 'attached <style> root forbidden via FORBID_TAGS',
+      tag: 'style',
+      attach: true,
+      cfg: { FORBID_TAGS: ['style'] },
+      strict: true,
+    },
+    {
+      label: 'parent-less <style> root forbidden via FORBID_TAGS',
+      tag: 'style',
+      attach: false,
+      cfg: { FORBID_TAGS: ['style'] },
+      strict: true,
+    },
+    {
+      label: 'attached disallowed <xmp> root',
+      tag: 'xmp',
+      attach: true,
+      cfg: {},
+      strict: true,
+    },
+    {
+      label: 'parent-less disallowed <xmp> root',
+      tag: 'xmp',
+      attach: false,
+      cfg: {},
+      strict: true,
+    },
+    {
+      label: 'attached <noembed> root allowed via ADD_TAGS',
+      tag: 'noembed',
+      attach: true,
+      cfg: { ADD_TAGS: ['noembed'] },
+      strict: false,
+    },
+    {
+      label: 'attached <svg> root killed by the svg/math mXSS check',
+      tag: 'svg',
+      html: '<p></p>' + GHSA6688_SINK,
+      attach: true,
+      cfg: {},
+      strict: true,
+    },
+  ].forEach(function (testCase) {
+    QUnit.test(
+      'GHSA-6688-9rhm-gjv2: IN_PLACE refuses a force-removed root: ' +
+        testCase.label,
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var root = document.createElement(testCase.tag);
+          root.setAttribute('onclick', 'window.__ghsa6688 = 2');
+          if (testCase.html) {
+            root.innerHTML = testCase.html;
+          } else {
+            root.textContent = '</' + testCase.tag + '>' + GHSA6688_SINK;
+          }
+
+          if (testCase.attach) {
+            document.body.appendChild(root);
+          }
+
+          var cfg = { IN_PLACE: true };
+          Object.keys(testCase.cfg).forEach(function (key) {
+            cfg[key] = testCase.cfg[key];
+          });
+
+          var message = null;
+          var ret = null;
+          try {
+            ret = purify.sanitize(root, cfg);
+          } catch (error) {
+            message = String(error && error.message);
+          } finally {
+            if (root.parentNode) {
+              root.parentNode.removeChild(root);
+            }
+          }
+
+          var refused = /refusing to sanitize in place/.test(message || '');
+          var rootRemoved = purify.removed.some(function (entry) {
+            return entry.element === root;
+          });
+          var sinks = ret ? ghsa6688ReparseSinks(ret) : 0;
+
+          if (testCase.strict || rootRemoved) {
+            assert.ok(
+              refused,
+              'force-removed IN_PLACE root must throw, got: ' +
+                message +
+                ', returned: ' +
+                (ret ? ret.outerHTML : ret)
+            );
+          } else {
+            assert.ok(
+              refused || ret === root,
+              'root is refused or returned as-is, got: ' + message
+            );
+          }
+
+          assert.equal(
+            sinks,
+            0,
+            'nothing handed back re-opens markup on reparse: ' +
+              (ret ? ret.outerHTML : ret)
+          );
+          assert.equal(
+            root.getAttribute('onclick'),
+            null,
+            'the on* handler on the root is cancelled'
+          );
+          assert.notOk(window.__ghsa6688, 'no payload ran');
+        });
+      }
+    );
+  });
+
 };
