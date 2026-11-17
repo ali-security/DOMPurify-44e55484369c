@@ -115,6 +115,7 @@ function createDOMPurify(window = getGlobal()) {
 
   const ElementPrototype = Element.prototype;
   const getParentNode = lookupGetter(ElementPrototype, 'parentNode');
+  const getNextSibling = lookupGetter(ElementPrototype, 'nextSibling');
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -693,12 +694,26 @@ function createDOMPurify(window = getGlobal()) {
       ) {
         try {
           const htmlToInsert = currentNode.innerHTML;
+          const nextSibling = getNextSibling(currentNode);
           currentNode.insertAdjacentHTML(
             'AfterEnd',
             trustedTypesPolicy
               ? trustedTypesPolicy.createHTML(htmlToInsert)
               : htmlToInsert
           );
+          /*
+             Count removals for an accurate element nesting depth
+             measurement to prevent mXSS attacks
+          */
+          const removalCount = (currentNode.__removalCount || 0) + 1;
+          let newNode = getNextSibling(currentNode);
+          while (newNode && newNode !== nextSibling) {
+            try {
+              newNode.__removalCount = removalCount;
+            } catch (_) {}
+
+            newNode = getNextSibling(newNode);
+          }
         } catch (_) {}
       }
 
@@ -1166,8 +1181,37 @@ function createDOMPurify(window = getGlobal()) {
         continue;
       }
 
+      const parentNode = getParentNode(currentNode);
+
+      /* Set the nesting depth of an element */
+      if (currentNode.nodeType === 1) {
+        if (parentNode && parentNode.__depth) {
+          /*
+            We want the depth of the node in the original tree, which can
+            change when it's removed from its parent.
+          */
+          currentNode.__depth =
+            (currentNode.__removalCount || 0) + parentNode.__depth + 1;
+        } else {
+          currentNode.__depth = 1;
+        }
+      }
+
+      /*
+       * Remove an element if nested too deeply to avoid mXSS
+       * or if the __depth might have been tampered with
+       */
+      if (
+        currentNode.__depth >= MAX_NESTING_DEPTH ||
+        currentNode.__depth < 0 ||
+        numberIsNaN(currentNode.__depth)
+      ) {
+        _forceRemove(currentNode);
+      }
+
       /* Shadow DOM detected, sanitize it */
       if (currentNode.content instanceof DocumentFragment) {
+        currentNode.content.__depth = currentNode.__depth;
         _sanitizeShadowDOM(currentNode.content);
       }
 

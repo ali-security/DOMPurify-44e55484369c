@@ -1476,16 +1476,19 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
         return '<div><template>' + html + '</template></div>';
       };
 
+      // The template content continues counting from the template's own
+      // depth (body > div > template = 3)
+
       // Nesting below the maximum depth is left untouched
       var dirty = wrap(repeat('<div>', 250) + repeat('</div>', 250));
       assert.equal(DOMPurify.sanitize(dirty), dirty);
 
-      dirty = wrap(repeat('<div>', 254) + repeat('</div>', 254));
+      dirty = wrap(repeat('<div>', 251) + repeat('</div>', 251));
       assert.equal(DOMPurify.sanitize(dirty), dirty);
 
       // Elements reaching the maximum depth are removed
-      var expected = wrap(repeat('<div>', 254) + repeat('</div>', 254));
-      dirty = wrap(repeat('<div>', 255) + repeat('</div>', 255));
+      var expected = wrap(repeat('<div>', 251) + repeat('</div>', 251));
+      dirty = wrap(repeat('<div>', 252) + repeat('</div>', 252));
       assert.equal(DOMPurify.sanitize(dirty), expected);
 
       dirty = wrap(
@@ -1518,8 +1521,8 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
         '<div><template>' +
         repeat('<div>', 200) +
         '<template>' +
-        repeat('<div>', 53) +
-        repeat('</div>', 53) +
+        repeat('<div>', 50) +
+        repeat('</div>', 50) +
         '</template>' +
         repeat('</div>', 200) +
         '</template></div>';
@@ -1566,20 +1569,14 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
         repeat('</div>', 600) +
         '</template></div>';
 
-      // Negative depth inherited by the template content
-      assert.equal(
-        sanitizePolluted(dirty, { __depth: -1000 }),
-        '<div><template></template></div>'
-      );
-      assert.equal(
-        sanitizePolluted(dirty, { __removalCount: -1000 }),
-        '<div><template><div></div></template></div>'
-      );
+      // Negative depth inherited by the elements of the document
+      assert.equal(sanitizePolluted(dirty, { __depth: -1000 }), '');
+      assert.equal(sanitizePolluted(dirty, { __removalCount: -1000 }), '');
 
-      // Depth turned into NaN (Infinity + -Infinity)
+      // Depth turned into NaN (Infinity + -Infinity) or Infinity
       assert.equal(
         sanitizePolluted(dirty, { __depth: -Infinity, __removalCount: Infinity }),
-        '<div><template></template></div>'
+        '<div></div>'
       );
 
       // Non-numeric depth makes every element look clobbered
@@ -1590,8 +1587,8 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       assert.equal(
         DOMPurify.sanitize(dirty),
         '<div><template>' +
-          repeat('<div>', 254) +
-          repeat('</div>', 254) +
+          repeat('<div>', 251) +
+          repeat('</div>', 251) +
           '</template></div>'
       );
     }
@@ -1619,8 +1616,8 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
           '<div><template><form><input name="' +
             names[i] +
             '">' +
-            repeat('<div>', 253) +
-            repeat('</div>', 253) +
+            repeat('<div>', 250) +
+            repeat('</div>', 250) +
             '</form></template></div>',
         ]);
       }
@@ -1668,6 +1665,159 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
         delete obj.constructor.prototype.ALLOWED_ATTR;
       }
       assert.equal(clean, '<img src="x">');
+    }
+  );
+  QUnit.test(
+    'Test proper handling of nesting-based mXSS 1/3',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+
+      var dirty = repeat('<div>', 250) + repeat('</div>', 250) + '<img>';
+      var expected = repeat('<div>', 250) + repeat('</div>', 250) + '<img>';
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      dirty = repeat('<div>', 255) + repeat('</div>', 255) + '<img>';
+      expected = repeat('<div>', 253) + repeat('</div>', 253) + '<img>';
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      dirty = repeat('<div>', 257) + repeat('</div>', 257) + '<img>';
+      expected = repeat('<div>', 253) + repeat('</div>', 253) + '<img>';
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      dirty =
+        repeat('<div>', 600) +
+        '<img src=x onerror=alert(1)>' +
+        repeat('</div>', 600);
+      expected = repeat('<div>', 253) + repeat('</div>', 253);
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      dirty =
+        '<div><template>' +
+        repeat('<div>', 257) +
+        repeat('</div>', 257) +
+        '<img>';
+      expected =
+        '<div><template>' +
+        repeat('<div>', 251) +
+        repeat('</div>', 251) +
+        '<img></template></div>';
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      dirty =
+        '<div><template>' +
+        repeat('<r>', 255) +
+        '<img>' +
+        repeat('</r>', 255) +
+        '</template></div><img>';
+      expected = [
+        '<div><template></template></div><img>',
+        '<div><template><html><head></head><body></body></html></template></div><img>',
+        '<div><template><head></head><body></body></template></div><img>',
+      ];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+    }
+  );
+  QUnit.test(
+    'Test proper handling of nesting-based mXSS 2/3',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+
+      var dirty =
+        '<form><input name="__depth">' +
+        repeat('<div>', 500) +
+        repeat('</div>', 500) +
+        '<img>';
+      var expected = [
+        '',
+        '<form><input name="__depth">' +
+          repeat('<div>', 252) +
+          repeat('</div>', 252) +
+          '<img></form>',
+      ];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+
+      dirty =
+        '<form><input name="__depth"></form>' +
+        repeat('<div>', 500) +
+        repeat('</div>', 500) +
+        '<img>';
+      expected = [
+        repeat('<div>', 253) + repeat('</div>', 253) + '<img>',
+        '<form><input name="__depth"></form>' +
+          repeat('<div>', 253) +
+          repeat('</div>', 253) +
+          '<img>',
+      ];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+
+      dirty =
+        '<form><input name="__removalCount">' +
+        repeat('<div>', 500) +
+        repeat('</div>', 500) +
+        '<img>';
+      expected = [
+        '',
+        '<form><input name="__removalCount">' +
+          repeat('<div>', 252) +
+          repeat('</div>', 252) +
+          '<img></form>',
+      ];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+
+      dirty =
+        '<form><input name="__removalCount"></form>' +
+        repeat('<div>', 500) +
+        repeat('</div>', 500) +
+        '<img>';
+      expected = [
+        repeat('<div>', 253) + repeat('</div>', 253) + '<img>',
+        '<form><input name="__removalCount"></form>' +
+          repeat('<div>', 253) +
+          repeat('</div>', 253) +
+          '<img>',
+      ];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+    }
+  );
+  QUnit.test(
+    'Test proper handling of nesting-based mXSS 3/3',
+    function (assert) {
+      var dirty = '<form><input name="__depth">';
+      var expected = ['', '<form><input name="__depth"></form>'];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+
+      dirty = '<form><input name="__removalCount">';
+      expected = ['', '<form><input name="__removalCount"></form>'];
+      assert.contains(DOMPurify.sanitize(dirty), expected);
+    }
+  );
+  QUnit.test(
+    'Test nesting depth of content hoisted by KEEP_CONTENT (mXSS)',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+
+      // Every node a removed element leaves behind keeps the depth it had
+      // in the original tree, not just the first one
+      var dirty =
+        repeat('<x>a', 260) +
+        '<div><img src=x onerror=alert(1)></div>' +
+        repeat('</x>', 260);
+      assert.equal(DOMPurify.sanitize(dirty), repeat('a', 260));
+
+      // A clobbered node among the hoisted ones must not stop the counting
+      dirty =
+        repeat('<x><form><input name="__removalCount"></form>', 260) +
+        '<div><img src=x onerror=alert(1)></div>' +
+        repeat('</x>', 260);
+      var clean = DOMPurify.sanitize(dirty);
+      assert.equal(clean.indexOf('<div'), -1);
+      assert.equal(clean.indexOf('<img'), -1);
     }
   );
 };
