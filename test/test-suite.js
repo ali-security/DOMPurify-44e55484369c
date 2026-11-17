@@ -2262,4 +2262,559 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       ]);
     }
   );
+
+  // ---------------------------------------------------------------------------
+  // CVE-2026-49459 (GHSA-r47g-fvhr-h676) - parent-less clobbered IN_PLACE root
+  // retains attacker-controlled attributes. When _forceRemove can't detach the
+  // root (no parent), any event-handler attribute on the root survives.
+  // sanitize() must instead throw on a clobbered IN_PLACE root.
+  // ---------------------------------------------------------------------------
+
+  // Does this engine implement HTMLFormElement [LegacyOverrideBuiltIns]
+  // named-property clobbering for the given name? (jsdom does not)
+  var formClobbers = function (name, tagName) {
+    var form = document.createElement('form');
+    var control = document.createElement(tagName || 'input');
+    control.setAttribute('name', name);
+    form.appendChild(control);
+    return form[name] === control;
+  };
+
+  QUnit.test(
+    'Config-Flag tests: IN_PLACE handles DOM-clobbered nodeName safely (CVE-2026-49459)',
+    function (assert) {
+      // Build the clobbering candidate.
+      var root = document.createElement('form');
+      root.innerHTML =
+        '<input name="nodeName" onclick="alert(1)">' +
+        '<input name="attributes" onclick="alert(2)">';
+
+      var clobbersNodeName = typeof root.nodeName !== 'string';
+
+      if (clobbersNodeName) {
+        assert.throws(
+          function () {
+            DOMPurify.sanitize(root, { IN_PLACE: true });
+          },
+          /clobbered/i,
+          'clobbered IN_PLACE root must throw in clobbering-capable engines'
+        );
+      } else {
+        var clean = DOMPurify.sanitize(root, { IN_PLACE: true });
+        assert.ok(
+          !/on\w+=/i.test(clean.outerHTML),
+          'no on-handler survived: ' + clean.outerHTML
+        );
+      }
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: parent-less clobbered form root throws instead of returning the root with onmouseover intact',
+    function (assert) {
+      if (!formClobbers('nodeName')) {
+        assert.ok(true, 'SKIP: no form clobbering in this engine');
+        return;
+      }
+
+      // The report's PoC: parent-less <form onmouseover=...> with an
+      // <input name="nodeName"> child that clobbers form.nodeName. The throw
+      // IS the protection: by refusing to return the root, the sanitizer
+      // makes it impossible for the caller to insert an attacker-controlled
+      // element into the live DOM.
+      var root = document.createElement('form');
+      root.setAttribute('onmouseover', 'window.__rooted_h676 = 1');
+      var clobber = document.createElement('input');
+      clobber.setAttribute('name', 'nodeName');
+      root.appendChild(clobber);
+
+      var result = null;
+      assert.throws(
+        function () {
+          result = DOMPurify.sanitize(root, { IN_PLACE: true });
+        },
+        /root node is clobbered/,
+        'clobbered parent-less IN_PLACE root must throw'
+      );
+      assert.equal(result, null, 'no node is handed back to the caller');
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: each clobbering name covered by _isClobbered triggers the IN_PLACE preamble throw',
+    function (assert) {
+      // Every name _isClobbered checks on this version. Any one of them
+      // flags the root, which _forceRemove can't detach, so each must make
+      // the IN_PLACE preamble throw.
+      var clobberNames = [
+        'nodeName',
+        'textContent',
+        'removeChild',
+        'attributes',
+        'removeAttribute',
+        'setAttribute',
+        'namespaceURI',
+        'insertBefore',
+        'hasChildNodes',
+        'childNodes',
+        'nodeType',
+        '__depth',
+        '__removalCount',
+      ];
+
+      for (var i = 0; i < clobberNames.length; i++) {
+        var name = clobberNames[i];
+        if (!formClobbers(name)) {
+          assert.ok(true, 'SKIP: no form clobbering of "' + name + '"');
+          continue;
+        }
+
+        var root = document.createElement('form');
+        root.setAttribute('onmouseover', 'window.__rooted_' + name + ' = 1');
+        root.setAttribute('action', 'javascript:alert(1)');
+        var clobber = document.createElement('input');
+        clobber.setAttribute('name', name);
+        root.appendChild(clobber);
+
+        assert.throws(
+          function () {
+            DOMPurify.sanitize(root, { IN_PLACE: true });
+          },
+          /root node is clobbered/,
+          'IN_PLACE preamble must throw for clobber name="' + name + '"'
+        );
+
+        // Re-sanitizing the same node must still refuse it
+        assert.throws(
+          function () {
+            DOMPurify.sanitize(root, {
+              IN_PLACE: true,
+              SAFE_FOR_TEMPLATES: true,
+            });
+          },
+          /root node is clobbered/,
+          'second IN_PLACE pass must throw for clobber name="' + name + '"'
+        );
+      }
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: a parented clobbered form is still sanitized normally (regression guard)',
+    function (assert) {
+      if (!formClobbers('nodeName')) {
+        assert.ok(true, 'SKIP: no form clobbering in this engine');
+        return;
+      }
+
+      // When the IN_PLACE root is NOT the clobbered form (it's a wrapper
+      // that contains it), the iterator-driven removal path works normally:
+      // _forceRemove succeeds because the form has a parent.
+      var wrapper = document.createElement('div');
+      var form = document.createElement('form');
+      form.setAttribute('onmouseover', 'window.__rooted_parented = 1');
+      var clobber = document.createElement('input');
+      clobber.setAttribute('name', 'nodeName');
+      form.appendChild(clobber);
+      wrapper.appendChild(form);
+
+      DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+      assert.equal(
+        wrapper.querySelectorAll('form').length,
+        0,
+        'parented clobbered form is removed by the iterator-driven path'
+      );
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: _isClobbered: form with name="childNodes" child is removed during sanitization',
+    function (assert) {
+      if (!formClobbers('childNodes')) {
+        assert.ok(true, 'SKIP: no form clobbering in this engine');
+        return;
+      }
+
+      var form = document.createElement('form');
+      var clobber = document.createElement('input');
+      clobber.setAttribute('name', 'childNodes');
+      form.appendChild(clobber);
+
+      var wrapper = document.createElement('div');
+      wrapper.appendChild(form);
+
+      DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+      assert.equal(
+        wrapper.querySelectorAll('form').length,
+        0,
+        'clobbered form must be removed'
+      );
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: _isClobbered: form clobbered by <select name="childNodes"> is still removed',
+    function (assert) {
+      // <select> defeats a naive `typeof childNodes.length === "number"`
+      // probe because HTMLSelectElement.length is a defined unsigned-long
+      // attribute returning the option count. The probe must instead compare
+      // the direct read against the cached Node.prototype getter, which is
+      // type-agnostic and catches every clobbering child.
+      if (!formClobbers('childNodes', 'select')) {
+        assert.ok(true, 'SKIP: no form clobbering in this engine');
+        return;
+      }
+
+      var form = document.createElement('form');
+      var clobber = document.createElement('select');
+      clobber.setAttribute('name', 'childNodes');
+      form.appendChild(clobber);
+
+      var wrapper = document.createElement('div');
+      wrapper.appendChild(form);
+
+      DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+      assert.equal(
+        wrapper.querySelectorAll('form').length,
+        0,
+        'form clobbered by <select name="childNodes"> must be removed'
+      );
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: form clobbered by name="nodeType" is removed so it cannot reset the nesting depth',
+    function (assert) {
+      if (!formClobbers('nodeType')) {
+        assert.ok(true, 'SKIP: no form clobbering in this engine');
+        return;
+      }
+
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+
+      // A form whose nodeType reads as its <input name="nodeType"> child
+      // skips the element depth bookkeeping, restarting the count for
+      // everything nested inside it.
+      var clean = DOMPurify.sanitize(
+        '<div><form><input name="nodeType">' +
+          repeat('<div>', 300) +
+          '<img src=x onerror=alert(1)>' +
+          repeat('</div>', 300) +
+          '</form></div>'
+      );
+      assert.equal(clean, '<div></div>', 'nodeType-clobbered form is removed');
+
+      var wrapper = document.createElement('div');
+      var form = document.createElement('form');
+      var clobber = document.createElement('input');
+      clobber.setAttribute('name', 'nodeType');
+      form.appendChild(clobber);
+      wrapper.appendChild(form);
+
+      DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+      assert.equal(
+        wrapper.querySelectorAll('form').length,
+        0,
+        'nodeType-clobbered form is removed in IN_PLACE mode'
+      );
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // CVE-2026-49458 (GHSA-hpcv-96wg-7vj8) - nodes from another window/realm.
+  // Security decisions keyed on `instanceof X` against this window's
+  // constructors short-circuit for foreign-realm nodes. Real iframes cannot
+  // reproduce this here (instanceof works across realms in jsdom and
+  // Firefox), so the DOMPurify instance below is built from a window whose
+  // constructors are not on the prototype chain of this document's nodes,
+  // exactly like the constructors of another realm, while the prototype
+  // getters stay the real ones.
+  // ---------------------------------------------------------------------------
+
+  var createForeignRealmPurify = function (NodeOverride) {
+    var foreign = function (Real) {
+      var Ctor = function () {};
+      Ctor.prototype = Object.create(Real ? Real.prototype : Object.prototype);
+      return Ctor;
+    };
+
+    return DOMPurify({
+      document: document,
+      DocumentFragment: foreign(window.DocumentFragment),
+      HTMLTemplateElement: window.HTMLTemplateElement,
+      Node: NodeOverride || foreign(window.Node),
+      NodeFilter: window.NodeFilter,
+      NamedNodeMap: foreign(window.NamedNodeMap || window.MozNamedAttrMap),
+      Element: foreign(window.Element),
+      Text: foreign(window.Text),
+      Comment: foreign(window.Comment),
+      DOMParser: window.DOMParser,
+    });
+  };
+
+  QUnit.test(
+    'CVE-2026-49458: foreign-realm IN_PLACE root is sanitized, not skipped as clobbered',
+    function (assert) {
+      var realmPurify = createForeignRealmPurify();
+
+      // Pre-fix `elm.attributes instanceof NamedNodeMap` was false for the
+      // foreign NamedNodeMap, so every element - the root included - looked
+      // clobbered. The parent-less root can't be removed, so its handlers
+      // survived uninspected.
+      var root = document.createElement('div');
+      root.setAttribute('onmouseover', 'alert(1)');
+      root.innerHTML = 'text<b onclick="alert(2)">bold</b>';
+
+      var clean = realmPurify.sanitize(root, { IN_PLACE: true });
+
+      assert.equal(clean, root, 'the input node is returned');
+      assert.equal(
+        root.getAttribute('onmouseover'),
+        null,
+        'onmouseover on the foreign-realm root must be stripped'
+      );
+      assert.equal(
+        root.innerHTML,
+        'text<b>bold</b>',
+        'children are sanitized, not dropped as clobbered'
+      );
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49458: foreign-realm clobbered form root throws on IN_PLACE',
+    function (assert) {
+      if (!formClobbers('attributes')) {
+        assert.ok(true, 'SKIP: no form clobbering in this engine');
+        return;
+      }
+
+      var realmPurify = createForeignRealmPurify();
+      var form = document.createElement('form');
+      form.setAttribute('onmouseover', 'alert(1)');
+      var clobber = document.createElement('input');
+      clobber.setAttribute('name', 'attributes');
+      form.appendChild(clobber);
+
+      assert.throws(
+        function () {
+          realmPurify.sanitize(form, { IN_PLACE: true });
+        },
+        /root node is clobbered/,
+        'foreign-realm clobbered form must throw on IN_PLACE'
+      );
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49458: foreign-realm <template>.content is walked and sanitized',
+    function (assert) {
+      var realmPurify = createForeignRealmPurify();
+
+      // Pre-fix `content instanceof DocumentFragment` was false for the
+      // foreign fragment, so the template body was never walked.
+      assert.equal(
+        realmPurify.sanitize(
+          '<b onclick=alert(1)>a</b><template><img src=x onerror=alert(2)></template>'
+        ),
+        '<b>a</b><template><img src="x"></template>',
+        'string input: template content is sanitized'
+      );
+
+      var wrapper = document.createElement('div');
+      wrapper.innerHTML =
+        '<template><img src="x" onerror="alert(3)"></template>';
+      var tpl = wrapper.firstChild;
+      if (!tpl.content) {
+        assert.ok(true, 'SKIP: no <template>.content in this engine');
+        return;
+      }
+
+      if (!tpl.content.firstChild) {
+        // The innerHTML setter does not target the template contents in
+        // this engine, build them through the inert contents document
+        while (tpl.firstChild) {
+          tpl.removeChild(tpl.firstChild);
+        }
+
+        var inertImg = tpl.content.ownerDocument.createElement('img');
+        inertImg.setAttribute('src', 'x');
+        inertImg.setAttribute('onerror', 'alert(3)');
+        tpl.content.appendChild(inertImg);
+      }
+
+      realmPurify.sanitize(wrapper, { IN_PLACE: true });
+
+      assert.equal(tpl.parentNode, wrapper, 'template is kept');
+      var img = tpl.content.firstChild;
+      assert.ok(img && img.nodeName === 'IMG', 'template content was reached');
+      assert.equal(
+        img && img.getAttribute('onerror'),
+        null,
+        'onerror inside foreign-realm <template> must be stripped'
+      );
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49458: cross-window node is not mistaken for a string in IN_PLACE mode (GHSA-4w3q-35jp-p934)',
+    function (assert) {
+      // Where `Node` is an object (older WebKit), _isNode relied on
+      // instanceof alone. A node from another window failed it, was
+      // stringified to "[object HTMLDivElement]", IN_PLACE was switched off
+      // and the node itself was never sanitized.
+      if (typeof Symbol === 'undefined' || !Symbol.hasInstance) {
+        assert.ok(true, 'SKIP: Symbol.hasInstance not available');
+        return;
+      }
+
+      var NodeObject = { prototype: Object.create(window.Node.prototype) };
+      Object.defineProperty(NodeObject, Symbol.hasInstance, {
+        value: function () {
+          return false;
+        },
+      });
+      var realmPurify = createForeignRealmPurify(NodeObject);
+
+      var root = document.createElement('div');
+      root.setAttribute('onmouseover', 'alert(1)');
+      root.innerHTML =
+        '<img src="x" onerror="alert(2)"><script>alert(3)</script>';
+
+      var clean = realmPurify.sanitize(root, { IN_PLACE: true });
+
+      assert.equal(clean, root, 'the input node is returned, not a string');
+      assert.equal(
+        root.getAttribute('onmouseover'),
+        null,
+        'onmouseover on the cross-window root must be stripped'
+      );
+      assert.equal(root.innerHTML, '<img src="x">', 'the node is sanitized');
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49458: cross-window form root clobbering nodeType or nodeName is refused, not stringified',
+    function (assert) {
+      // The cross-realm _isNode fallback reads nodeType through the cached
+      // getter, so a clobbered form of another realm is still recognized as
+      // a node and then refused by the IN_PLACE clobbering pre-flight
+      // instead of being stringified and handed back untouched.
+      var names = ['nodeType', 'nodeName', 'childNodes', 'attributes'];
+      var realmPurify = createForeignRealmPurify();
+      for (var i = 0; i < names.length; i++) {
+        if (!formClobbers(names[i])) {
+          assert.ok(true, 'SKIP: no form clobbering of "' + names[i] + '"');
+          continue;
+        }
+
+        var form = document.createElement('form');
+        form.setAttribute('onmouseover', 'alert(1)');
+        var clobber = document.createElement('input');
+        clobber.setAttribute('name', names[i]);
+        form.appendChild(clobber);
+
+        assert.throws(
+          function () {
+            realmPurify.sanitize(form, { IN_PLACE: true });
+          },
+          /root node is clobbered/,
+          'cross-window form clobbered by name="' + names[i] + '" must throw'
+        );
+      }
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: IN_PLACE root made to look clobbered by a polluted Object.prototype throws instead of keeping its handlers',
+    function (assert) {
+      // A non-numeric __depth / __removalCount inherited from a polluted
+      // Object.prototype makes every element look clobbered. The parent-less
+      // root then could not be removed and its attributes were never
+      // inspected. The IN_PLACE pre-flight must refuse such a root.
+      var pollutions = [
+        ['__depth', 'x'],
+        ['__removalCount', 'x'],
+      ];
+      for (var i = 0; i < pollutions.length; i++) {
+        var root = document.createElement('a');
+        root.setAttribute('href', 'javascript:alert(1)');
+        root.setAttribute('onmouseover', 'alert(2)');
+        var message = null;
+        Object.prototype[pollutions[i][0]] = pollutions[i][1];
+        try {
+          DOMPurify.sanitize(root, { IN_PLACE: true });
+        } catch (error) {
+          message = String(error && error.message);
+        } finally {
+          delete Object.prototype[pollutions[i][0]];
+        }
+
+        assert.ok(
+          /root node is clobbered/.test(message || ''),
+          'Object.prototype.' +
+            pollutions[i][0] +
+            ': IN_PLACE root must throw, got: ' +
+            message +
+            ', onmouseover kept: ' +
+            root.hasAttribute('onmouseover')
+        );
+      }
+    }
+  );
+
+  QUnit.test(
+    'CVE-2026-49459: unclobbered IN_PLACE roots are still sanitized (regression guard)',
+    function (assert) {
+      // A plain form root is not refused by the pre-flight
+      var form = document.createElement('form');
+      form.setAttribute('onmouseover', 'alert(1)');
+      form.setAttribute('action', 'javascript:alert(2)');
+      form.appendChild(document.createElement('input'));
+      var clean = DOMPurify.sanitize(form, { IN_PLACE: true });
+      assert.equal(clean, form, 'the root node itself is returned');
+      assert.equal(form.hasAttribute('onmouseover'), false, 'onmouseover removed');
+      assert.equal(form.hasAttribute('action'), false, 'javascript: action removed');
+      assert.equal(form.querySelectorAll('input').length, 1, 'input is kept');
+
+      // A document fragment root is not an element and is not refused, a
+      // clobbered form inside it is removed by the main loop
+      var fragment = document.createDocumentFragment();
+      var nested = document.createElement('form');
+      nested.setAttribute('onmouseover', 'alert(3)');
+      var clobber = document.createElement('input');
+      clobber.setAttribute('name', 'childNodes');
+      nested.appendChild(clobber);
+      fragment.appendChild(nested);
+      var div = document.createElement('div');
+      div.setAttribute('onclick', 'alert(4)');
+      fragment.appendChild(div);
+      DOMPurify.sanitize(fragment, { IN_PLACE: true });
+      if (formClobbers('childNodes')) {
+        assert.equal(
+          fragment.querySelectorAll('form').length,
+          0,
+          'clobbered form inside a fragment root is removed'
+        );
+      } else {
+        assert.equal(
+          nested.hasAttribute('onmouseover'),
+          false,
+          'onmouseover removed from the form inside a fragment root'
+        );
+      }
+
+      assert.equal(
+        div.hasAttribute('onclick'),
+        false,
+        'onclick removed from the element inside a fragment root'
+      );
+    }
+  );
 };
