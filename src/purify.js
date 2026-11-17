@@ -604,6 +604,46 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _scrubTemplateExpressions
+   * Strip template-engine expressions ({{...}}, <%...%>) from the
+   * serialized markup of an element subtree. Used as the final safety net for
+   * SAFE_FOR_TEMPLATES on every DOM-returning code path so that expressions
+   * which only form after text-node normalization (e.g. fragments split across
+   * stripped elements) cannot survive into a template-evaluating framework.
+   *
+   * @param  {Node} node The root node whose markup should be scrubbed
+   */
+  const _scrubTemplateExpressions = function (node) {
+    node.normalize();
+
+    /* Roots without markup of their own (e.g. a DocumentFragment sanitized
+       in-place) are scrubbed child by child */
+    if (typeof node.innerHTML !== 'string') {
+      arrayForEach(node.childNodes, (childNode) => {
+        if (childNode.nodeType === 1) {
+          _scrubTemplateExpressions(childNode);
+        } else if (childNode.nodeType === 3) {
+          let content = childNode.textContent;
+          content = stringReplace(content, MUSTACHE_EXPR, ' ');
+          content = stringReplace(content, ERB_EXPR, ' ');
+          if (childNode.textContent !== content) {
+            childNode.textContent = content;
+          }
+        }
+      });
+      return;
+    }
+
+    let html = node.innerHTML;
+    arrayForEach([MUSTACHE_EXPR, ERB_EXPR], (expr) => {
+      html = stringReplace(html, expr, ' ');
+    });
+    node.innerHTML = trustedTypesPolicy
+      ? trustedTypesPolicy.createHTML(html)
+      : html;
+  };
+
+  /**
    * _isClobbered
    *
    * @param  {Node} elm element to check for clobbering attacks
@@ -1292,11 +1332,19 @@ function createDOMPurify(window = getGlobal()) {
 
     /* If we sanitized `dirty` in-place, return it. */
     if (IN_PLACE) {
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(dirty);
+      }
+
       return dirty;
     }
 
     /* Return sanitized string or DOM */
     if (RETURN_DOM) {
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(body);
+      }
+
       if (RETURN_DOM_FRAGMENT) {
         returnNode = createDocumentFragment.call(body.ownerDocument);
 

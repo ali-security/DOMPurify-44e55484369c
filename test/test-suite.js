@@ -520,6 +520,164 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
     assert.equal(dirty, clean); // should return the input node
     assert.equal(dirty.href, ''); // should still sanitize
   });
+  QUnit.test(
+    'Config-Flag tests: SAFE_FOR_TEMPLATES strips boundary-spanning Mustache expressions in IN_PLACE mode',
+    function (assert) {
+      // Regression for the IN_PLACE counterpart of CVE-2026-41239.
+      // Per-text-node scrubbing alone misses {{...}} whose halves sit on
+      // either side of a stripped foreign element: each text node holds only
+      // a single '{' or '}', so MUSTACHE_EXPR (which requires '{{' or '}}')
+      // matches nothing. After sanitization removes the foreign element the
+      // surrounding text fragments are adjacent, and the serialized
+      // innerHTML — which is what a template-evaluating framework reads —
+      // shows '{{...}}' as a single interpolatable expression.
+      var dirty = document.createElement('div');
+      dirty.innerHTML =
+        '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+      DOMPurify.sanitize(dirty, {
+        SAFE_FOR_TEMPLATES: true,
+        IN_PLACE: true,
+      });
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(dirty.innerHTML),
+        'merged Mustache expression should be scrubbed'
+      );
+      assert.notOk(
+        /constructor/.test(dirty.innerHTML),
+        'expression body should not survive scrubbing'
+      );
+    }
+  );
+  QUnit.test(
+    'Config-Flag tests: SAFE_FOR_TEMPLATES strips boundary-spanning Mustache expressions in IN_PLACE mode on a DocumentFragment',
+    function (assert) {
+      // Same bug class as above, for an in-place root that has no innerHTML
+      // of its own: the merged text nodes must still be scrubbed.
+      var dirty = document.createDocumentFragment();
+      var wrapper = document.createElement('div');
+      wrapper.innerHTML =
+        '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+      dirty.appendChild(wrapper);
+      var clean = DOMPurify.sanitize(dirty, {
+        SAFE_FOR_TEMPLATES: true,
+        IN_PLACE: true,
+      });
+      assert.equal(dirty, clean, 'should return the input node');
+      var container = document.createElement('div');
+      container.appendChild(dirty);
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(container.innerHTML),
+        'merged Mustache expression should be scrubbed'
+      );
+      assert.notOk(
+        /constructor/.test(container.innerHTML),
+        'expression body should not survive scrubbing'
+      );
+      // Expression halves sitting directly on the fragment root
+      var source = document.createElement('div');
+      source.innerHTML =
+        '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+      dirty = document.createDocumentFragment();
+      while (source.firstChild) {
+        dirty.appendChild(source.firstChild);
+      }
+
+      clean = DOMPurify.sanitize(dirty, {
+        SAFE_FOR_TEMPLATES: true,
+        IN_PLACE: true,
+      });
+      assert.equal(dirty, clean, 'should return the input node');
+      container = document.createElement('div');
+      container.appendChild(dirty);
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(container.innerHTML),
+        'merged Mustache expression should be scrubbed on the fragment root'
+      );
+      assert.notOk(
+        /constructor/.test(container.innerHTML),
+        'expression body should not survive scrubbing on the fragment root'
+      );
+    }
+  );
+  QUnit.test(
+    'Config-Flag tests: SAFE_FOR_TEMPLATES pins RETURN_DOM_FRAGMENT scrub behavior',
+    function (assert) {
+      // RETURN_DOM_FRAGMENT was fixed alongside RETURN_DOM in CVE-2026-41239
+      // (both reach the body.innerHTML scrub). Pinning the fragment path
+      // here so future refactors of the post-walk return logic do not
+      // silently regress it.
+      var result = DOMPurify.sanitize(
+        '<div>{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}</div>',
+        {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM_FRAGMENT: true,
+        }
+      );
+      var container = document.createElement('div');
+      container.appendChild(result);
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(container.innerHTML),
+        'merged Mustache expression should be scrubbed in fragment mode'
+      );
+    }
+  );
+  QUnit.test(
+    'Config-Flag tests: SAFE_FOR_TEMPLATES with RETURN_DOM',
+    function (assert) {
+      // CVE-2026-41239: the expression halves only merge once the foreign
+      // elements are stripped, so the returned body must be scrubbed too.
+      var returnNode = DOMPurify.sanitize(
+        '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}',
+        {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        }
+      );
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(returnNode.innerHTML),
+        'merged Mustache expression should be scrubbed in RETURN_DOM mode'
+      );
+      assert.notOk(
+        /constructor/.test(returnNode.innerHTML),
+        'expression body should not survive scrubbing'
+      );
+      // Same payload passed in as a DOM node
+      var dirty = document.createElement('div');
+      dirty.innerHTML =
+        '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+      returnNode = DOMPurify.sanitize(dirty, {
+        SAFE_FOR_TEMPLATES: true,
+        RETURN_DOM: true,
+      });
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(returnNode.innerHTML),
+        'merged Mustache expression should be scrubbed for DOM node input'
+      );
+      assert.notOk(
+        /constructor/.test(returnNode.innerHTML),
+        'expression body should not survive scrubbing for DOM node input'
+      );
+      // Same payload with the returned node imported into the document
+      returnNode = DOMPurify.sanitize(
+        '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}',
+        {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+          RETURN_DOM_IMPORT: true,
+        }
+      );
+      assert.notOk(
+        /\{\{[\s\S]*\}\}/.test(returnNode.innerHTML),
+        'merged Mustache expression should be scrubbed with RETURN_DOM_IMPORT'
+      );
+      // Markup without template expressions is left intact
+      returnNode = DOMPurify.sanitize('<a>123</a><b>456</b>', {
+        SAFE_FOR_TEMPLATES: true,
+        RETURN_DOM: true,
+      });
+      assert.equal(returnNode.innerHTML, '<a>123</a><b>456</b>');
+    }
+  );
   QUnit.test('Config-Flag tests: FORBID_TAGS', function (assert) {
     //FORBID_TAGS
     assert.equal(
