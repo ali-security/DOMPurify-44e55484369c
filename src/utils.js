@@ -1,4 +1,11 @@
-const { hasOwnProperty, setPrototypeOf, isFrozen, keys: objectKeys } = Object;
+const {
+  hasOwnProperty,
+  setPrototypeOf,
+  isFrozen,
+  getPrototypeOf,
+  getOwnPropertyDescriptor,
+  keys: objectKeys,
+} = Object;
 
 let { freeze, seal } = Object; // eslint-disable-line import/no-mutable-exports
 let { apply, construct } = typeof Reflect !== 'undefined' && Reflect;
@@ -44,6 +51,11 @@ const regExpTest = unapply(RegExp.prototype.test);
 const regExpCreate = unconstruct(RegExp);
 
 const typeErrorCreate = unconstruct(TypeError);
+
+export function numberIsNaN(x) {
+  // eslint-disable-next-line no-self-compare
+  return x !== x;
+}
 
 export function unapply(func) {
   return (thisArg, ...args) => apply(func, thisArg, args);
@@ -97,6 +109,34 @@ export function clone(object) {
   return newObject;
 }
 
+/* IE10 doesn't support __lookupGetter__ so lets'
+ * simulate it. It also automatically checks
+ * if the prop is function or getter and behaves
+ * accordingly. */
+function lookupGetter(object, prop) {
+  while (object !== null) {
+    const desc = getOwnPropertyDescriptor(object, prop);
+    if (desc) {
+      if (desc.get) {
+        return unapply(desc.get);
+      }
+
+      if (typeof desc.value === 'function') {
+        return unapply(desc.value);
+      }
+    }
+
+    object = getPrototypeOf(object);
+  }
+
+  function fallbackValue(element) {
+    console.warn('fallback value for', element);
+    return null;
+  }
+
+  return fallbackValue;
+}
+
 export {
   // Array
   arrayForEach,
@@ -112,6 +152,7 @@ export {
   objectKeys,
   setPrototypeOf,
   seal,
+  lookupGetter,
   // RegExp
   regExpCreate,
   regExpTest,

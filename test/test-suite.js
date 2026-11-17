@@ -1466,4 +1466,164 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       assert.equal(clean, '<a href="data:image/gif;base64,123">icon.gif</a>');
     }
   );
+  QUnit.test(
+    'Test nesting depth limit inside template content (mXSS)',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+      var wrap = function (html) {
+        return '<div><template>' + html + '</template></div>';
+      };
+
+      // Nesting below the maximum depth is left untouched
+      var dirty = wrap(repeat('<div>', 250) + repeat('</div>', 250));
+      assert.equal(DOMPurify.sanitize(dirty), dirty);
+
+      dirty = wrap(repeat('<div>', 254) + repeat('</div>', 254));
+      assert.equal(DOMPurify.sanitize(dirty), dirty);
+
+      // Elements reaching the maximum depth are removed
+      var expected = wrap(repeat('<div>', 254) + repeat('</div>', 254));
+      dirty = wrap(repeat('<div>', 255) + repeat('</div>', 255));
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      dirty = wrap(
+        repeat('<div>', 600) +
+          '<img src=x onerror=alert(1)>' +
+          repeat('</div>', 600)
+      );
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+    }
+  );
+  QUnit.test(
+    'Test nesting depth propagation across nested template content (mXSS)',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+
+      // The inner template content must not restart counting at zero
+      var dirty =
+        '<div><template>' +
+        repeat('<div>', 200) +
+        '<template>' +
+        repeat('<div>', 200) +
+        '<img src=x onerror=alert(1)>' +
+        repeat('</div>', 200) +
+        '</template>' +
+        repeat('</div>', 200) +
+        '</template></div>';
+      var expected =
+        '<div><template>' +
+        repeat('<div>', 200) +
+        '<template>' +
+        repeat('<div>', 53) +
+        repeat('</div>', 53) +
+        '</template>' +
+        repeat('</div>', 200) +
+        '</template></div>';
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+    }
+  );
+  QUnit.test(
+    'Test nesting depth tampering via prototype pollution',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+
+      // Find the Object.prototype that DOM nodes actually inherit from
+      var objectPrototype = document.createDocumentFragment();
+      while (Object.getPrototypeOf(objectPrototype) !== null) {
+        objectPrototype = Object.getPrototypeOf(objectPrototype);
+      }
+
+      var sanitizePolluted = function (dirty, pollution) {
+        var keys = Object.keys(pollution);
+        var i;
+        for (i = 0; i < keys.length; i++) {
+          Object.defineProperty(objectPrototype, keys[i], {
+            value: pollution[keys[i]],
+            writable: true,
+            configurable: true,
+          });
+        }
+
+        try {
+          return DOMPurify.sanitize(dirty);
+        } finally {
+          for (i = 0; i < keys.length; i++) {
+            delete objectPrototype[keys[i]];
+          }
+        }
+      };
+
+      var dirty =
+        '<div><template>' +
+        repeat('<div>', 600) +
+        '<img src=x onerror=alert(1)>' +
+        repeat('</div>', 600) +
+        '</template></div>';
+
+      // Negative depth inherited by the template content
+      assert.equal(
+        sanitizePolluted(dirty, { __depth: -1000 }),
+        '<div><template></template></div>'
+      );
+      assert.equal(
+        sanitizePolluted(dirty, { __removalCount: -1000 }),
+        '<div><template><div></div></template></div>'
+      );
+
+      // Depth turned into NaN (Infinity + -Infinity)
+      assert.equal(
+        sanitizePolluted(dirty, { __depth: -Infinity, __removalCount: Infinity }),
+        '<div><template></template></div>'
+      );
+
+      // Non-numeric depth makes every element look clobbered
+      assert.equal(sanitizePolluted(dirty, { __depth: '-1000' }), '');
+      assert.equal(sanitizePolluted(dirty, { __removalCount: '-1000' }), '');
+
+      // Back to normal once the pollution is gone
+      assert.equal(
+        DOMPurify.sanitize(dirty),
+        '<div><template>' +
+          repeat('<div>', 254) +
+          repeat('</div>', 254) +
+          '</template></div>'
+      );
+    }
+  );
+  QUnit.test(
+    'Test nesting depth tampering via DOM clobbering',
+    function (assert) {
+      var repeat = function (str, times) {
+        return new Array(times + 1).join(str);
+      };
+      var names = ['__depth', '__removalCount'];
+      for (var i = 0; i < names.length; i++) {
+        var clean = DOMPurify.sanitize(
+          '<div><template><form><input name="' +
+            names[i] +
+            '">' +
+            repeat('<div>', 600) +
+            '<img src=x onerror=alert(1)>' +
+            repeat('</div>', 600) +
+            '</form></template></div>'
+        );
+        assert.contains(clean, [
+          '<div><template></template></div>',
+          // No named form properties (jsdom)
+          '<div><template><form><input name="' +
+            names[i] +
+            '">' +
+            repeat('<div>', 253) +
+            repeat('</div>', 253) +
+            '</form></template></div>',
+        ]);
+      }
+    }
+  );
 };
