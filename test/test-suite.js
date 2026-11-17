@@ -1092,6 +1092,228 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
     }
   );
 
+  /* CVE-2026-65902: hook-driven allowlist pollution. The data.allowedTags /
+     data.allowedAttributes fields handed to uponSanitizeElement /
+     uponSanitizeAttribute hooks are references to the live ALLOWED_TAGS /
+     ALLOWED_ATTR sets, which are the module-level defaults when no explicit
+     ALLOWED_TAGS / ALLOWED_ATTR is configured. A hook writing
+     data.allowedTags.script = true must not widen the defaults of later
+     calls, even after removeAllHooks() and clearConfig(). The sets are
+     cloned per sanitize() call whenever such a hook is registered, so the
+     documented in-call widening keeps working. Each test uses a fresh
+     instance, as the bug under test is cross-call pollution. */
+  var withFreshPurify = function (callback) {
+    var purify = DOMPurify(window);
+    try {
+      callback(purify);
+    } finally {
+      purify.removeAllHooks();
+      purify.clearConfig();
+    }
+  };
+  QUnit.test(
+    'CVE-2026-65902: baseline, <script> and onclick are stripped under default config',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        assert.equal(
+          purify.sanitize('<svg><script>alert(1)</script></svg>'),
+          '<svg></svg>',
+          'fresh default sanitize strips <script>'
+        );
+        assert.equal(
+          purify.sanitize('<a onclick="alert(1)">x</a>'),
+          '<a>x</a>',
+          'fresh default sanitize strips onclick'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: in-call widening via hook still works',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeElement', function (node, data) {
+          if (data.tagName === 'is-custom') {
+            data.allowedTags['is-custom'] = true;
+          }
+        });
+        purify.addHook('uponSanitizeAttribute', function (node, data) {
+          if (data.attrName === 'super-custom') {
+            data.allowedAttributes['super-custom'] = true;
+          }
+        });
+
+        var input = '<p>HE<is-custom super-custom="test">LLO</is-custom></p>';
+        assert.equal(
+          purify.sanitize(input),
+          input,
+          'guarded hook widens allowlist for matching element in-call'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: unguarded element hook does not poison subsequent default-config calls',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeElement', function (node, data) {
+          // The leaky pattern: unconditionally widen
+          data.allowedTags.script = true;
+        });
+
+        assert.equal(
+          purify.sanitize('<svg><script>1</script></svg>'),
+          '<svg><script>1</script></svg>',
+          'in-call widening still works while hook is registered'
+        );
+
+        purify.removeAllHooks();
+        purify.clearConfig();
+
+        assert.equal(
+          purify.sanitize('<svg><script>alert(1)</script></svg>'),
+          '<svg></svg>',
+          'default sanitize after element-hook removal strips <script>'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: unguarded attribute hook does not poison subsequent default-config calls',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeAttribute', function (node, data) {
+          data.allowedAttributes.onclick = true;
+        });
+
+        assert.ok(
+          purify.sanitize('<a onclick="alert(1)">x</a>').indexOf('onclick') !==
+            -1,
+          'in-call widening still works for attribute hook'
+        );
+
+        purify.removeAllHooks();
+        purify.clearConfig();
+
+        assert.equal(
+          purify.sanitize('<a onclick="alert(1)">x</a>'),
+          '<a>x</a>',
+          'default sanitize after attr-hook removal strips onclick'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: pollution does not cross instance boundaries',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeElement', function (node, data) {
+          data.allowedTags.script = true;
+        });
+        purify.sanitize('<svg><script>alert(1)</script></svg>');
+
+        var freshInstance = DOMPurify(window);
+        assert.equal(
+          freshInstance.sanitize('<svg><script>alert(1)</script></svg>'),
+          '<svg></svg>',
+          'fresh DOMPurify instance must not inherit poisoned defaults'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: read-only hook does not poison defaults',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        var sawScriptKey;
+        purify.addHook('uponSanitizeElement', function (node, data) {
+          if (sawScriptKey === undefined) {
+            sawScriptKey = 'script' in data.allowedTags;
+          }
+        });
+
+        purify.sanitize('<div><span>hi</span></div>');
+
+        assert.strictEqual(
+          sawScriptKey,
+          false,
+          'hook sees default allowlist with script NOT included'
+        );
+
+        purify.removeAllHooks();
+        purify.clearConfig();
+
+        assert.equal(
+          purify.sanitize('<svg><script>alert(1)</script></svg>'),
+          '<svg></svg>',
+          'read-only hook does not poison defaults'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: multiple polluting calls do not accumulate state in defaults',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeElement', function (node, data) {
+          data.allowedTags.script = true;
+          data.allowedTags.iframe = true;
+          data.allowedTags.object = true;
+        });
+
+        for (var i = 0; i < 10; i++) {
+          purify.sanitize('<div></div>');
+        }
+
+        purify.removeAllHooks();
+        purify.clearConfig();
+
+        assert.equal(
+          purify.sanitize('<svg><script>1</script></svg>'),
+          '<svg></svg>',
+          'script still stripped after 10 polluting calls'
+        );
+        assert.equal(
+          purify.sanitize('<iframe src="x"></iframe>'),
+          '',
+          'iframe still stripped after 10 polluting calls'
+        );
+        assert.equal(
+          purify.sanitize('<object data="x"></object>'),
+          '',
+          'object still stripped after 10 polluting calls'
+        );
+      });
+    }
+  );
+  QUnit.test(
+    'CVE-2026-65902: explicit cfg.ALLOWED_TAGS path is unaffected by hook mutation in other calls',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeElement', function (node, data) {
+          data.allowedTags.script = true;
+        });
+
+        var withCfg = purify.sanitize('<svg><script>alert(1)</script></svg>', {
+          ALLOWED_TAGS: ['svg'],
+        });
+        assert.ok(
+          withCfg.indexOf('<script>') !== -1,
+          'explicit-cfg call respects in-call hook widening: ' + withCfg
+        );
+
+        purify.removeAllHooks();
+        purify.clearConfig();
+
+        assert.equal(
+          purify.sanitize('<svg><script>alert(1)</script></svg>'),
+          '<svg></svg>',
+          'default-cfg call after explicit-cfg+hook is unaffected'
+        );
+      });
+    }
+  );
+
   QUnit.test(
     'sanitize() should allow unknown protocols when ALLOW_UNKNOWN_PROTOCOLS is true',
     function (assert) {

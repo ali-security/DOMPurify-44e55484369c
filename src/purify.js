@@ -1291,22 +1291,26 @@ function createDOMPurify(window = getGlobal()) {
        * by a hook) does not carry over. */
       ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
       ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
-
-      /* The uponSanitizeElement hook event exposes ALLOWED_TAGS (as
-       * allowedTags) and the uponSanitizeAttribute hook event exposes
-       * ALLOWED_ATTR (as allowedAttributes) by reference. Clone them before
-       * the walk whenever such a hook is registered, so a hook that widens
-       * them - documented in-call widening - only mutates this call's copy
-       * and never the persistent configuration. */
-      if (_hasHooks('uponSanitizeElement')) {
-        ALLOWED_TAGS = clone(ALLOWED_TAGS);
-      }
-
-      if (_hasHooks('uponSanitizeAttribute')) {
-        ALLOWED_ATTR = clone(ALLOWED_ATTR);
-      }
     } else {
       _parseConfig(cfg);
+    }
+
+    /* The uponSanitizeElement hook event exposes ALLOWED_TAGS (as
+     * allowedTags) and the uponSanitizeAttribute hook event exposes
+     * ALLOWED_ATTR (as allowedAttributes) by reference. Without an explicit
+     * ALLOWED_TAGS / ALLOWED_ATTR those are the module-level defaults, so a
+     * hook that widens them would mutate the shared sets permanently, across
+     * later calls and even after removeAllHooks() / clearConfig(). Clone them
+     * per walk whenever such a hook is registered, so documented in-call
+     * widening only mutates this call's copy. A single guard for both config
+     * paths - the per-call path rebinds the sets in _parseConfig, the
+     * persistent path restores them from the pristine bindings above. */
+    if (_hasHooks('uponSanitizeElement')) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (_hasHooks('uponSanitizeAttribute')) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
     }
 
     /* Clean up removed elements */
